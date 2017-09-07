@@ -671,7 +671,8 @@ common::check_pip_packages () {
   logecho -n "Checking required PIP packages: "
 
   for prereq in $*; do
-    pip list | fgrep -w $prereq > /dev/null || missing+=($prereq)
+    (pip list --format legacy 2>&- || pip list) |\
+     fgrep -w $prereq > /dev/null || missing+=($prereq)
   done
 
   if ((${#missing[@]}>0)); then
@@ -701,7 +702,12 @@ common::check_packages () {
   # Make sure a bunch of packages are available
   logecho -n "Checking required system packages: "
 
-  distro=$(lsb_release -si)
+  if ((FLAGS_gcb)); then
+    # Just force Ubuntu
+    distro="Ubuntu"
+  else
+    distro=$(lsb_release -si)
+  fi
   case $distro in
     Fedora)
       packagemgr="dnf"

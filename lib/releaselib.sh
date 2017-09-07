@@ -112,7 +112,7 @@ release::set_build_version () {
   # Shorten
   branch_head=${branch_head:0:14}
   # The instructions below for installing yq put it in /usr/local/bin
-  local yq="/usr/local/bin/yq"
+  local yq=$(which yq || echo "/usr/local/bin/yq")
   local job_prefix="ci-kubernetes-"
   local -a JOB
   local -a secondary_jobs
@@ -127,6 +127,10 @@ release::set_build_version () {
    $K8S_GITHUB_RAW_ORG/test-infra/master/testgrid/config/config.yaml \
    2>/dev/null |\
    $yq -r '.[] | .[] | select (.name=="sig-'$branch'-blocking") |.dashboard_tab[].test_group_name' 2>/dev/null))
+
+  if [[ -z ${all_jobs[*]} ]]; then
+    logecho "FAILED: Curl to testgrid/config/config.yaml"
+  fi
 
   local main_job="${all_jobs[0]}"
 

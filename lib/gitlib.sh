@@ -20,14 +20,30 @@
 ###############################################################################
 # CONSTANTS
 ###############################################################################
-GHCURL="curl -s --fail --retry 10 -u ${GITHUB_TOKEN:-$FLAGS_github_token}:x-oauth-basic"
+# TODO: This needs to be pulled into .netrc or some other more secure location
+# Any contributor could by accident or on purpose change the yaml or this script
+# directly to "set -x" in which case, the TOKEN would be readable in the
+# GCB logs
+# netrc with git doesn't seem to work, but a combination approach with
+# netrc for curl and git remotes with embedded tokens might be an answer
+# the files themselves in the container don't need to be encrypted necessarily
+# as noone has access to those, but we can't expose this via the env
+: ${GITHUB_TOKEN:=$FLAGS_github_token}
+GHCURL="curl -s --fail --retry 10 -u $GITHUB_TOKEN:x-oauth-basic"
 JCURL="curl -g -s --fail --retry 10"
-K8S_GITHUB_API='https://api.github.com/repos/kubernetes/kubernetes'
+K8S_GITHUB_API_ROOT='https://api.github.com/repos'
+K8S_GITHUB_API="$K8S_GITHUB_API_ROOT/kubernetes/kubernetes"
 K8S_GITHUB_RAW_ORG='https://raw.githubusercontent.com/kubernetes'
 
 K8S_GITHUB_SEARCHAPI='https://api.github.com/search/issues?per_page=100&q=is:pr%20repo:kubernetes/kubernetes%20'
 K8S_GITHUB_URL='https://github.com/kubernetes/kubernetes'
-K8S_GITHUB_SSH='git@github.com:kubernetes/kubernetes.git'
+if ((FLAGS_gcb)); then
+  K8S_GITHUB_AUTH_ROOT="https://git@github.com/"
+else
+  # ssh
+  K8S_GITHUB_AUTH_ROOT="git@github.com:"
+fi
+K8S_GITHUB_AUTH_URL="${K8S_GITHUB_AUTH_ROOT}kubernetes/kubernetes.git"
 
 # Regular expressions for bash regex matching
 # 0=entire branch name
@@ -53,9 +69,8 @@ declare -A VER_REGEX=([release]="v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9
 # guidance for setup
 #
 gitlib::ssh_auth () {
-
   logecho -n "Checking ssh auth to github.com: "
-  if ssh -T ${K8S_GITHUB_SSH%%:*} 2>&1 |fgrep -wq denied; then
+  if ssh -T ${K8S_GITHUB_AUTH_URL%%:*} 2>&1 |fgrep -wq denied; then
     logecho $FAILED
     logecho
     logecho "See https://help.github.com/categories/ssh"
@@ -89,6 +104,16 @@ gitlib::is_repo_admin () {
     logecho "2. Use the 'Request to Join' button on https://github.com/orgs/kubernetes/teams/kubernetes-release-managers/members"
     return 1
   fi
+}
+
+###############################################################################
+# Sets up basic git config elements for running within GCB
+#
+# returns 1 on failure
+gitlib::git_config_for_gcb () {
+  # TODO: CHANGE THIS BEFORE CHECKIN
+  logrun git config --global user.email "kubernetes@cncf.io" || return 1
+  logrun git config --global user.name "Anago GCB" || return 1
 }
 
 ###############################################################################
@@ -172,11 +197,14 @@ gitlib::pending_prs () {
 
 ###############################################################################
 # Validates github token using the standard $GITHUB_TOKEN in your env
+# Ensures you have 'private' access to the repo
 # returns 0 if token is valid
 # returns 1 if token is invalid
 gitlib::github_api_token () {
   logecho -n "Checking for a valid github API token: "
-  if ! $GHCURL $K8S_GITHUB_API >/dev/null 2>&1; then
+  if [[ $($GHCURL $K8S_GITHUB_API -I) =~ Cache-Control:\ private ]]; then
+    logecho -r "$OK"
+  else
     logecho -r "$FAILED"
     logecho
     logecho "No valid github token found in environment or command-line!"
@@ -191,7 +219,6 @@ gitlib::github_api_token () {
     logecho "   * Specify your --github-token=<token> on the command line"
     common::exit 1
   fi
-  logecho -r "$OK"
 }
 
 ##############################################################################
@@ -211,6 +238,14 @@ gitlib::sync_repo () {
     ) || return 1
   else
     logrun -s git clone $repo $dest || return 1
+
+    # for https, update the remotes so we don't have to call the git command-line
+    # every time with a token
+    (
+    cd $dest
+    git remote set-url origin $(git remote get-url origin |\
+     sed "s,https://git@github.com,https://git:${GITHUB_TOKEN:-$FLAGS_github_token}@github.com,g")
+    )
   fi
 }
 
@@ -262,3 +297,8 @@ gitlib::repo_state () {
     return 1
   fi
 }
+
+# Set up git config for GCB
+if ((FLAGS_gcb)); then
+  gitlib::git_config_for_gcb || common::exit "Exiting..."
+fi

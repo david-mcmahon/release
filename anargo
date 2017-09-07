@@ -1,0 +1,53 @@
+#!/bin/bash
+# Set PROGram name
+PROG=${0##*/}
+#
+# Anargo - The Kubernetes release process (anago) on GCB.
+#
+# Very basic.  Needs cleanup and CLI triggering is only a backup method
+
+source $(dirname $(readlink -ne $BASH_SOURCE))/lib/common.sh
+source $TOOL_LIB_PATH/gitlib.sh
+
+GCLOUD_ACCOUNT="highcpu@kubernetes-release-test.iam.gserviceaccount.com"
+PROJECT="kubernetes-release-test"
+BUILD_VERSION="$FLAGS_buildversion"
+JSON_TEMPLATE="$TOOL_ROOT/$PROG.json.template"
+TEMP_JSON="/tmp/$PROG.json"
+
+# Check the primary reason this script exists
+if [[ -z $BUILD_VERSION ]]; then
+  logecho
+  logecho "Must set a --buildversion=something"
+  logecho "If you can just rely on the in-line test analysis, just fire off the"
+  logecho "build on the" \
+          "https://pantheon.corp.google.com/gcr/builds?project=$PROJECT" \
+          "console."
+  logecho
+  logecho "Otherwise, run find_green_build and pick your favorite failing" \
+          "build to manually trigger by passing in the value here."
+  logecho
+  logecho "See RELEASE_WORKFLOW_CHOICES.md"
+  logecho
+  common::exit 1
+fi
+
+# Prerequsites
+# Check the highcpu gcloud account associated with $PROJECT
+logecho
+logecho -n "gcloud auth login $GCLOUD_ACCOUNT: "
+if ! logrun -s gcloud auth login $GCLOUD_ACCOUNT; then
+  common::exit 1 "You must have access to and be authorized to log into $GCLOUD_ACCOUNT!"
+fi
+
+# Make the TEMP JSON
+sed "s,@BUILD_VERSION@,$BUILD_VERSION,g" $JSON_TEMPLATE > $TEMP_JSON
+
+# do the build via json to get timeout and high cpu working
+if ! curl -X POST \
+          -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+          -T $TEMP_JSON \
+          https://cloudbuild.googleapis.com/v1/projects/$PROJECT/builds; then
+  common::exit 1 "Something didn't go right."
+fi
+logecho "See $TEMP_JSON for the json that was submitted"

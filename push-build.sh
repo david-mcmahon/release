@@ -22,8 +22,14 @@ PROG=${0##*/}
 #+     $PROG - Push Kubernetes Release Artifacts up to GCS
 #+
 #+ SYNOPSIS
-#+     $PROG  [--nomock] [--federation] [--noupdatelatest] [--ci]
-#+            [--bucket=<GS bucket>]
+#+     $PROG  [--nomock] [--federation] [--noupdatelatest]
+#+            [--ci] [--release-type=ci|release|devel]
+#+            [--output-suffix=<_output suffix>]
+#+            [--version=x.y.z|x.y.z-(alpha|beta).n]
+#+            [--version-suffix=ver suffix]
+#+            [--extra-publish-file=file]
+#+            [--docker-registry=/path|GCR]
+#+            [--bucket=<GS bucket>] [--gcs-suffix=GCS suffix]
 #+     $PROG  [--helpshort|--usage|-?]
 #+     $PROG  [--help|-man]
 #+
@@ -51,6 +57,8 @@ PROG=${0##*/}
 #+                                 (normally devel or ci)
 #+     [--gcs-suffix=]           - Specify a suffix to append to the upload
 #+                                 destination on GCS.
+#+     [--output-suffix=]        - Specify a suffix to append to the _output
+#+                                 build directory
 #+     [--docker-registry=]      - If set, push docker images to specified
 #+                                 registry/project
 #+     [--version-suffix=]       - Append suffix to version name if set.
@@ -100,29 +108,32 @@ common::timestamp begin
 # MAIN
 ###############################################################################
 RELEASE_BUCKET=${FLAGS_bucket:-"kubernetes-release-dev"}
+VERSION="$FLAGS_version"
 # Compatibility with incoming global args
 [[ $KUBE_GCS_UPDATE_LATEST == "n" ]] && FLAGS_noupdatelatest=1
 
 # This will canonicalize the path
 KUBE_ROOT=$(pwd -P)
 
-KUBECTL_OUTPUT=$(cluster/kubectl.sh version --client 2>&1 || true)
-if [[ "$KUBECTL_OUTPUT" =~ GitVersion:\"(${VER_REGEX[release]}(\.${VER_REGEX[build]})?(-dirty)?)\", ]]; then
-  LATEST=${BASH_REMATCH[1]}
-  if ((FLAGS_ci)) && [[ "$KUBECTL_OUTPUT" =~ GitTreeState:\"dirty\" ]]; then
-    logecho "Refusing to push dirty build with --ci flag given."
-    logecho "CI builds should always be performed from clean commits."
+if [[ -z $VERSION ]]; then
+  KUBECTL_OUTPUT=$(cluster/kubectl.sh version --client 2>&1 || true)
+  if [[ "$KUBECTL_OUTPUT" =~ GitVersion:\"(${VER_REGEX[release]}(\.${VER_REGEX[build]})?(-dirty)?)\", ]]; then
+    VERSION=${BASH_REMATCH[1]}
+    if ((FLAGS_ci)) && [[ "$KUBECTL_OUTPUT" =~ GitTreeState:\"dirty\" ]]; then
+      logecho "Refusing to push dirty build with --ci flag given."
+      logecho "CI builds should always be performed from clean commits."
+      logecho
+      logecho "kubectl version output:"
+      logecho $KUBECTL_OUTPUT
+      common::exit 1
+    fi
+  else
+    logecho "Unable to get latest version from build tree!"
     logecho
     logecho "kubectl version output:"
     logecho $KUBECTL_OUTPUT
     common::exit 1
   fi
-else
-  logecho "Unable to get latest version from build tree!"
-  logecho
-  logecho "kubectl version output:"
-  logecho $KUBECTL_OUTPUT
-  common::exit 1
 fi
 
 USE_BAZEL=false
@@ -133,17 +144,19 @@ if release::was_built_with_bazel $KUBE_ROOT; then
   # that the version we got from kubectl is correct.
   logecho "Checking that Bazel build is up-to-date"
   bazel build //:version
-  BAZEL_LATEST=$(cat $KUBE_ROOT/bazel-genfiles/version)
-  if [[ $BAZEL_LATEST != $LATEST ]]; then
-    logecho "kubectl version $LATEST doesn't match Bazel version $BAZEL_LATEST."
+  BAZEL_VERSION=$(cat $KUBE_ROOT/bazel-genfiles/version)
+  if [[ $BAZEL_VERSION != $VERSION ]]; then
+    logecho "kubectl version $VERSION doesn't match Bazel version $BAZEL_VERSION."
     logecho "Do you need to rebuild?"
     common::exit 1
   fi
 fi
 
 if [[ -n "${FLAGS_version_suffix:-}" ]]; then
-  LATEST+="-${FLAGS_version_suffix}"
+  VERSION+="-${FLAGS_version_suffix}"
 fi
+
+OUTPUT_DIR="$KUBE_ROOT/_output$FLAGS_output_suffix"
 
 GCS_DEST="devel"
 ((FLAGS_ci)) && GCS_DEST="ci"
@@ -157,7 +170,8 @@ if ((FLAGS_nomock)); then
   logecho
 else
   # Point to a $USER playground
-  RELEASE_BUCKET+=-$USER
+  # Strip off existing -$USER if incoming (from anago)
+  RELEASE_BUCKET=${RELEASE_BUCKET/-$USER/}-$USER
 fi
 
 ##############################################################################
@@ -182,14 +196,14 @@ common::stepheader COPY RELEASE ARTIFACTS
 attempt=0
 while ((attempt<max_attempts)); do
   if $USE_BAZEL; then
-    release::gcs::bazel_push_build $GCS_DEST $LATEST $KUBE_ROOT/_output \
+    release::gcs::bazel_push_build $GCS_DEST $VERSION $OUTPUT_DIR \
                                    $RELEASE_BUCKET && break
   else
-    release::gcs::locally_stage_release_artifacts $GCS_DEST $LATEST \
+    release::gcs::locally_stage_release_artifacts $GCS_DEST $VERSION \
                                                   $KUBE_ROOT/_output
     release::gcs::push_release_artifacts \
-     $KUBE_ROOT/_output/gcs-stage/$LATEST \
-     gs://$RELEASE_BUCKET/$GCS_DEST/$LATEST && break
+     $KUBE_ROOT/_output/gcs-stage/$VERSION \
+     gs://$RELEASE_BUCKET/$GCS_DEST/$VERSION && break
   fi
   ((attempt++))
 done
@@ -201,8 +215,7 @@ if [[ -n "${FLAGS_docker_registry:-}" ]]; then
   ##############################################################################
   # TODO: support Bazel too
   # Docker tags cannot contain '+'
-  release::docker::release $FLAGS_docker_registry ${LATEST/+/_} \
-    $KUBE_ROOT/_output
+  release::docker::release $FLAGS_docker_registry ${VERSION/+/_} $OUTPUT_DIR
 fi
 
 # If not --ci, then we're done here.
@@ -214,7 +227,7 @@ if ! ((FLAGS_noupdatelatest)); then
   ##############################################################################
   attempt=0
   while ((attempt<max_attempts)); do
-    release::gcs::publish_version $GCS_DEST $LATEST $KUBE_ROOT/_output \
+    release::gcs::publish_version $GCS_DEST $VERSION $OUTPUT_DIR \
                                   $RELEASE_BUCKET $GCS_EXTRA_PUBLISH_FILE && break
     ((attempt++))
   done

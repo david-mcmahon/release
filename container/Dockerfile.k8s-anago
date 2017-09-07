@@ -1,0 +1,42 @@
+# To rebuild and publish this container run:
+#   build.sh in this directory
+
+# Based on cross builder
+# This should be based on master or release-* branches
+FROM gcr.io/google_containers/kube-cross:v1.8.3-2
+
+# Install packages
+# curl jq ca-certificates
+RUN apt-get -q update && apt-get install -qqy apt-transport-https \
+    git gnupg2 lsb-release python \
+    software-properties-common wget python-setuptools python-dev \
+    build-essential pandoc gettext-base
+
+# Install Pip packages
+RUN easy_install pip
+RUN pip install yq
+
+# Install jq 1.4.  Ubuntu repos have 1.5 which does not work with release scripts.
+RUN wget -O /usr/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.4/jq-linux-x86_64 && \
+    chmod ug+x /usr/bin/jq
+
+# Install gcloud
+RUN echo "deb https://packages.cloud.google.com/apt cloud-sdk-$(lsb_release -cs) main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - && \
+    apt-get -q update && \
+    apt-get install -qqy google-cloud-sdk
+
+
+# docker-ce dependencies
+RUN \
+   apt-get -y update && \
+   apt-get install -y \
+      iptables libltdl7 && \
+   apt-get -y update
+
+ADD https://download.docker.com/linux/debian/dists/jessie/pool/stable/amd64/docker-ce_17.06.2~ce-0~debian_amd64.deb /docker-ce_17.06.2~ce-0~debian_amd64.deb
+RUN dpkg -i /docker-ce_17.06.2~ce-0~debian_amd64.deb
+
+# Packages required by the make in k8s
+# localtime
+RUN apt-get -q update && apt-get install -qqy tzdata

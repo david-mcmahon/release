@@ -30,7 +30,7 @@ PROG=${0##*/}
 #+            [--security_layer=/path/to/pointer/to/script]
 #+            [--exclude-suites="<suite> ..."]
 #+            [--build-at-head]
-#+            [--mailto=<email1>,<email2>]
+#+            [--mailto=<email1>,<email2>] [--gcb] [--domain=<domain>]
 #+     $PROG  [--helpshort|--usage|-?]
 #+     $PROG  [--help|-man]
 #+
@@ -126,6 +126,8 @@ PROG=${0##*/}
 #+     [--build-at-head]         - Force a build at HEAD of named branch
 #+     [--mailto=]               - Comma-separated list of addresses to send
 #+                                 announcement email to. Overrides default list.
+#+     [--domain=]               - Specify an (alternate) domain
+#+     [--gcb]                   - Running from GCB
 #+     [--help | -man]           - display man page for this script
 #+     [--usage | -?]            - display in-line usage
 #+
@@ -203,11 +205,18 @@ fi
 # @param exit code
 #
 common::cleanexit () {
-  tput cnorm
+  [[ -t 1 ]] && tput cnorm
 
   logrun rm -rf $LOCAL_CACHE
 
-  [[ -d $WORKDIR ]] && copy_logs_to_workdir
+  if [[ -d $WORKDIR ]]; then
+    if ((FLAGS_gcb)); then
+      # Just copy the logs and files up. A completed release copies everything
+      archive_release --files-only
+    else
+      copy_logs_to_workdir
+    fi
+  fi
 
   common::timestamp end
   exit ${1:-0}
@@ -278,6 +287,8 @@ ensure_registry_acls () {
 #
 check_prerequisites () {
   local userat="$USER@$DOMAIN_NAME"
+  local -a users_to_check
+  local rb
 
   security_layer::auth_check 2 || return 1
 
@@ -289,10 +300,15 @@ check_prerequisites () {
     return 1
   fi
 
+  # Under gcb, don't check explicitly for the G_AUTH_USER.  That user simply
+  # has permissions based onthe $PROJECT_ID
+  ((FLAGS_gcb)) || users_to_check+=($G_AUTH_USER)
+  users_to_check+=($userat)
+
   # TODO: Users outside google? Ask/derive domain?
   # TODO: The real test here is to verify that whatever auth has access to
   #       do releasey things
-  for user in $G_AUTH_USER $userat; do
+  for user in ${users_to_check[*]}; do
     logecho -n "Checking cloud account/auth $user: "
     if (logrun gcloud config set account $user && \
         logrun gcloud docker -- version >/dev/null 2>&1); then
@@ -324,8 +340,10 @@ check_prerequisites () {
   # to ensure both mock and --nomock runs will work.
   ensure_registry_acls "${ALL_CONTAINER_REGISTRIES[*]}" || return 1
 
-  # Verify write access to $RELEASE_BUCKET
-  release::gcs::ensure_release_bucket $RELEASE_BUCKET || return 1
+  # Verify write access to $ALL_RELEASE_BUCKETS
+  for rb in ${ALL_RELEASE_BUCKETS[*]}; do
+    release::gcs::ensure_release_bucket $rb || return 1
+  done
 
   logecho -n "Checking cloud project state: "
   GCLOUD_PROJECT=$($GCLOUD config get-value project 2>/dev/null)
@@ -594,6 +612,7 @@ prepare_tree () {
 build_tree () {
   local version=$1
   local branch=$(gitlib::current_branch)
+  local release_target="release"
 
   # Convert a detached head state to something more readable
   [[ "$branch" == HEAD ]] && branch="master (detached head)"
@@ -607,8 +626,13 @@ build_tree () {
   #       modifiable.  In the meantime just mv the dir after it's done
   # Not until https://github.com/kubernetes/kubernetes/issues/23839
   #logrun -s make release OUT_DIR=$BUILD_OUTPUT-${RELEASE_VERSION[$label]}
-  # KUBE_DOCKER_IMAGE_TAG required for hyperkube in build/lib/release.sh
-  logrun -s make release KUBE_DOCKER_IMAGE_TAG="$version" || common::exit 1
+
+  if ((FLAGS_gcb)); then
+    logrun -s -v make cross-in-a-container package-tarballs \
+                 KUBE_DOCKER_IMAGE_TAG="$version"
+  else
+    logrun -s make release KUBE_DOCKER_IMAGE_TAG="$version"
+  fi || common::exit 1
 
   logecho -n "Moving build _output to $BUILD_OUTPUT-$version: "
   logrun -s mv $BUILD_OUTPUT $BUILD_OUTPUT-$version
@@ -810,6 +834,100 @@ EOF
 }
 
 ###############################################################################
+# Search for a matching release tracking issue
+# @param version RELEASE_VERSION_PRIME
+# returns 1 if none found
+# prints most recent issue maching
+search_release_issue () {
+  local version=$1
+  local issue
+
+  issue=$($GHCURL $K8S_GITHUB_SEARCHAPI_ROOT&q=Release+$version+Tracking+in:title+type:issue+state:open+repo:$RELEASE_TRACKING_REPO | jq -r '.items[] | (.number | tostring)' |sort -n |tail -1)
+
+  [[ -z $issue ]] && return 1
+
+  echo $issue
+}
+
+###############################################################################
+# Create a release tracking issue for posting notifications.
+# Mostly for use by --gcb since there's no other email mechanism from which
+# to send detailed html notifictions.
+# @param version RELEASE_VERSION_PRIME
+create_release_issue () {
+  local version=$1
+  local assignee="david-mcmahon"
+  local milestone
+  local stage
+  local text
+  local cc
+  local repo
+  local issue_number
+
+  # Set the milestone and stage
+  if [[ $version =~ ${VER_REGEX[release]} ]]; then
+    milestone=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
+    stage=${BASH_REMATCH[4]/-/}
+  fi
+
+  if ((FLAGS_nomock)); then
+    repo="kubernetes/features"
+    # default to 1.8 release owner for now
+    # TODO: Can we make the assignee some sig-release group user?
+    assignee="jdumars"
+    # Would be nice to have a broad distribution list here on par with email
+    # distributions
+    cc="@kubernetes/sig-release-members"
+  else
+    # TODO: DO NOT CHECKIN
+    # Need a real mock repo to update issues in
+    # Also this might have to be a global if we end up using
+    # comment_release_issue() and search_release_issue()
+    repo="david-mcmahon/release"
+    # Force milestone to null on this repo or the curl hangs
+    milestone="null"
+  fi
+
+  text="Kubernetes $version has been built and pushed.\n\nThe release notes have been updated in <A HREF=https://github.com/kubernetes/kubernetes/blob/master/$CHANGELOG_FILE/#${version//\./}>$CHANGELOG_FILE</A> with a pointer to it on <A HREF=https://github.com/kubernetes/kubernetes/releases/tag/$version>github</A>"
+
+  # If the milestone doesn't exist, this will fail.
+  # May want to check that and only add if there's a valid value to add, Ugh.
+  issue_number=$($GHCURL $K8S_GITHUB_API_ROOT/$repo/issues --data \
+  "{
+    \"title\": \"Release $version Tracking\",
+    \"body\": \"$text\ncc $cc\n\",
+    \"assignee\": \"$assignee\",
+    \"milestone\": $milestone,
+    \"labels\": [
+      \"sig-release\",
+      \"stage/${stage:-stable}\"
+    ]
+  }" |jq -r '.number')
+
+  if [[ -n $issue_number ]]; then
+    logecho "Created issue #$issue_number on github:"
+    logecho "http://github.com/$repo/issues/$issue_number"
+  else
+    logecho "There was a problem creating the release tracking issue"
+    logecho "This should be done manually."
+  fi
+}
+
+###############################################################################
+# Create a release tracking issue for posting notifications.
+# Mostly for use by --gcb since there's no other email mechanism from which
+# to send detailed html notifictions.
+comment_release_issue () {
+  local issue=$1
+
+  $GHCURL $K8S_GITHUB_API_ROOT/$RELEASE_TRACKING_REPO/issues/$issue/comments \
+   --data \
+  "{
+  \"body\": \"$(awk '{printf "%s\\n", $0}' $HOME/look/release-notes.md)\"
+  }"
+}
+
+###############################################################################
 # Mail out the announcement
 # @param subject - the subject for the email notification
 announce () {
@@ -832,16 +950,23 @@ announce () {
    || common::askyorn -e "Pausing here. Confirm announce to $mailto" \
    || common::exit 1 "Exiting..."
 
-  logecho "Announcing k8s $RELEASE_VERSION_PRIME to $mailto..."
+  if ((FLAGS_gcb)); then
+    logecho "Copying k8s $RELEASE_VERSION_PRIME announcement text" \
+            "to $WORKDIR..."
+    logrun cp $announcement_text $WORKDIR/announcement.html
+  else
+    logecho "Announcing k8s $RELEASE_VERSION_PRIME to $mailto..."
 
-  # Always cc invoker
-  # Due to announcements landing on public mailing lists requiring membership,
-  # post from the invoking user (for now until this is productionized further)
-  # and use reply-to to ensure replies go to the right place.
-  common::sendmail -h "$mailto" "K8s-Anago<$USER@$DOMAIN_NAME>" \
-                   "K8s-Anago<cloud-kubernetes-release@google.com>" \
-                   "$subject" "$USER@$DOMAIN_NAME" \
-                   "$announcement_text" --html || return 1
+    # Always cc invoker
+    # Due to announcements landing on public mailing lists requiring membership,
+    # post from the invoking user (for now until this is productionized further)
+    # and use reply-to to ensure replies go to the right place.
+    common::sendmail -h "$mailto" "K8s-Anago<$USER@$DOMAIN_NAME>" \
+                     "K8s-Anago<cloud-kubernetes-release@google.com>" \
+                     "$subject" "$USER@$DOMAIN_NAME" \
+                     "$announcement_text" --html || return 1
+  
+  fi
 
   logrun rm -f $announcement_text
 }
@@ -1108,30 +1233,35 @@ prepare_workspace () {
   if ! ((FLAGS_noclean)) && \
      {((FLAGS_stage)) || ! is_staged_locally ${RELEASE_VERSION[@]};}; then
     # Sync the tree
-    gitlib::sync_repo $K8S_GITHUB_SSH $TREE_ROOT || return 1
+    gitlib::sync_repo $K8S_GITHUB_AUTH_URL $TREE_ROOT || return 1
   fi
-
   logrun cd $TREE_ROOT
 }
 
 
 ##############################################################################
 # Archive the release on GS
+# @param --files-only - non-recursive
 archive_release () {
+  local arg=$1
   local archive_bucket="gs://$RELEASE_BUCKET/archive"
   local build_dir=${WORKDIR##*/}
-
-  ((FLAGS_yes)) \
-   || common::askyorn -y "Archive this release on $archive_bucket" || return
+  local text="files"
 
   copy_logs_to_workdir
 
-  logecho -n "Copy $WORKDIR to $archive_bucket: "
-  logrun -s $GSUTIL -mq cp -r $WORKDIR $archive_bucket || return 1
+  if [[ $arg != "--files-only" ]]; then
+    dash_args="-rc"
+    text="contents"
+  fi
+
+  # Best effort
+  logecho "Copy $WORKDIR $text to $archive_bucket/$build_dir..."
+  logrun $GSUTIL -mq cp $dash_args $WORKDIR/* $archive_bucket/$build_dir || true
 
   logecho -n "Ensure PRIVATE ACL on $archive_bucket/$build_dir/anago.log\*: "
-  logrun -s $GSUTIL acl ch -d AllUsers "$archive_bucket/$build_dir/anago.log*" \
-   || return 1
+  logrun -s $GSUTIL acl ch -d AllUsers \
+            "$archive_bucket/$build_dir/${LOGFILE##*/}*" || return 1
 }
 
 
@@ -1153,6 +1283,7 @@ if ((FLAGS_stage)); then
 else
   BUCKET_TYPE="release"
 fi
+ALL_RELEASE_BUCKETS=("$RELEASE_BUCKET")
 if ((FLAGS_nomock)); then
   # Override any --noclean setting if nomock
   FLAGS_noclean=0
@@ -1164,6 +1295,7 @@ else
   LOGRUN_MOCK="-m"
   # Point to a $USER playground
   RELEASE_BUCKET+=-$USER
+  ALL_RELEASE_BUCKETS+=("$RELEASE_BUCKET")
   GCRIO_REPO="${FLAGS_gcrio_repo:-kubernetes-release-test}"
   ALL_CONTAINER_REGISTRIES=("$GCRIO_REPO" "google_containers")
 fi
@@ -1199,29 +1331,41 @@ common::logfileinit $LOGFILE 10
 # BEGIN script
 common::timestamp begin
 
-# Check tool repo
-gitlib::repo_state || common::exit 1
+if ((FLAGS_gcb)); then
+  logecho "Running inside GCB.  Skipping:"
+  logecho "* gitlib::repo_state"
+  logecho "* common::security_layer"
+else
+  # Check tool repo
+  gitlib::repo_state || common::exit 1
 
-# Additional functionality
-common::security_layer
+  # Additional functionality
+  common::security_layer
+fi
 
 if ! ((FLAGS_stage)); then
   ##############################################################################
   common::stepheader "CHECK GITHUB AUTH"
   ##############################################################################
   gitlib::github_api_token
-  gitlib::ssh_auth
+  ((FLAGS_gcb)) || gitlib::ssh_auth
   gitlib::is_repo_admin
 fi
 
 # Domain check
-if [[ "$HOSTNAME" =~ \.([^\.]+\.com)$ ]]; then
-  DOMAIN_NAME=${FLAGS_domain:-${BASH_REMATCH[1]}}
-  if ! [[ -n $DOMAIN_NAME ]]; then
-    common::exit 1 "Unable to determine your domain." \
-                   "Pass it in on the command-line" \
-                   "with --domain=<yourdomain.com>"
-  fi
+if [[ "$FLAGS_domain" ]]; then
+  DOMAIN_NAME="$FLAGS_domain"
+elif ((FLAGS_gcb)); then
+  # Force this for GCB
+  DOMAIN_NAME="cloudbuild.gserviceaccount.com"
+elif [[ "$HOSTNAME" =~ \.([^\.]+\.com)$ ]]; then
+  DOMAIN_NAME=${BASH_REMATCH[1]}
+fi
+
+if ! [[ -n $DOMAIN_NAME ]]; then
+  common::exit 1 "Unable to determine your domain." \
+                 "Pass it in on the command-line" \
+                 "with --domain=<yourdomain.com>"
 fi
 
 # Simple check to validate who can do actual releases
@@ -1232,7 +1376,10 @@ fi
 ##############################################################################
 common::stepheader "CHECK PREREQUISITES"
 ##############################################################################
-common::check_packages jq docker-engine pandoc ${PREREQUISITE_PACKAGES[*]}
+# We check for docker here as a word which passes for docker-ce and
+# docker-engine as docker packages are in transiation of deprecating
+# docker-engine
+common::check_packages jq docker pandoc ${PREREQUISITE_PACKAGES[*]}
 common::check_pip_packages yq || common::exit 1 "Exiting..."
 check_prerequisites || common::exit 1 "Exiting..."
 
@@ -1273,7 +1420,7 @@ common::stepheader "DISK SPACE CHECK"
 # A recent run of release-1.8 --official took:
 # ~95G in the build tree
 # ~90G in the docker dir
-common::disk_space_check $BASEDIR $((100*${#RELEASE_VERSION[*]})) \
+common::disk_space_check $BASEDIR $((75*${#RELEASE_VERSION[*]})) \
  || common::exit 1 "Exiting..."
 
 if [[ $RELEASE_BRANCH =~ release- ]] &&
@@ -1411,10 +1558,11 @@ fi
 # Used in release::docker::release()
 source $TREE_ROOT/hack/lib/golang.sh
 
+((FLAGS_nomock)) && NOMOCK_PASSTHRU_FLAG="--nomock"
 # Push for each release version of this session
 for label in ${!RELEASE_VERSION[@]}; do
   ##############################################################################
-  common::stepheader "PUSH ${RELEASE_VERSION[$label]} IMAGES"
+  common::stepheader "PUSH ${RELEASE_VERSION[$label]} ARTIFACTS"
   ##############################################################################
   # If --stage, then stage locally
   # if ! --stage, and ! already found/*STAGED_LOCALLY, then stage
@@ -1483,10 +1631,22 @@ else
   common::runstep announce "k8s $RELEASE_VERSION_PRIME is live!" \
    || common::exit 1 "Exiting..."
 
-  ##############################################################################
-  common::stepheader "UPDATE GITHUB RELEASES PAGE"
-  ##############################################################################
-  common::runstep update_github_release || common::exit 1 "Exiting..."
+  # For GCB create/update a release tracking issue
+  if ((FLAGS_gcb)); then
+    ###########################################################################
+    common::stepheader "CREATE/UPDATE RELEASE TRACKING ISSUE"
+    ###########################################################################
+    #if search_release_issue $RELEASE_VERSION_PRIME; then
+    #  comment_release_issue
+    #else
+      create_release_issue $RELEASE_VERSION_PRIME
+    #fi
+  else
+    ###########################################################################
+    common::stepheader "UPDATE GITHUB RELEASES PAGE"
+    ###########################################################################
+    common::runstep update_github_release || common::exit 1 "Exiting..."
+  fi
 
   ##############################################################################
   common::stepheader "ARCHIVE RELEASE ON GS"
